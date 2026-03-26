@@ -1,25 +1,175 @@
 from fastapi import FastAPI, UploadFile, File
 import shutil
 import os
+import re
+import csv
+import io
 from datetime import datetime
 from app.face_service import verify_faces
 
 from app.database import pan_db, aadhaar_db, kyc_db
 from app.ocr_service import (
     extract_text,
+    extract_text_candidates,
     extract_pan,
     extract_name,
     extract_dob,
     extract_aadhaar,
-    normalize_ocr_date
+    normalize_ocr_date,
 )
 
 app = FastAPI()
 
 
+def _normalize_name(value: str | None) -> str:
+    """Uppercase and strip non-letters so OCR punctuation/spacing does not cause false mismatch."""
+    if not value:
+        return ""
+    return re.sub(r"[^A-Z]", "", value.upper())
+
+
+def _names_match(ocr_name: str | None, db_name: str | None) -> bool:
+    o = _normalize_name(ocr_name)
+    d = _normalize_name(db_name)
+    if not o or not d:
+        return False
+    return o == d or o in d or d in o
+
+
+def _row_value(row: dict, *keys: str) -> str | None:
+    lowered = {str(k).strip().lower(): v for k, v in row.items()}
+    for key in keys:
+        value = lowered.get(key.lower())
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _normalize_pan_number(value: str | None) -> str | None:
+    cleaned = re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+    return cleaned if re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", cleaned) else None
+
+
+def _normalize_aadhaar_number(value: str | None) -> str | None:
+    cleaned = re.sub(r"\D", "", (value or ""))
+    return cleaned if re.fullmatch(r"\d{12}", cleaned) else None
+
+
+def _normalize_master_dob(value: str | None) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    return None
+
+
+def _decode_csv_content(content: bytes) -> str:
+    return content.decode("utf-8-sig", errors="ignore")
+
+
+def _seed_pan_csv(content: bytes) -> dict:
+    text = _decode_csv_content(content)
+    reader = csv.DictReader(io.StringIO(text))
+
+    if not reader.fieldnames:
+        return {"inserted": 0, "updated": 0, "skipped": 0, "errors": ["CSV header missing"]}
+
+    inserted = 0
+    updated = 0
+    skipped = 0
+    errors = []
+
+    for line_no, row in enumerate(reader, start=2):
+        pan_number = _normalize_pan_number(_row_value(row, "pan_number", "pan", "pan_no", "panno"))
+        name = _row_value(row, "name", "full_name", "customer_name")
+        dob = _normalize_master_dob(_row_value(row, "dob", "date_of_birth", "birth_date"))
+
+        if not pan_number or not name or not dob:
+            skipped += 1
+            errors.append(f"line {line_no}: invalid pan/name/dob")
+            continue
+
+        result = pan_db.update_one(
+            {"pan_number": pan_number},
+            {"$set": {"pan_number": pan_number, "name": name.upper(), "dob": dob}},
+            upsert=True,
+        )
+        if result.upserted_id is not None:
+            inserted += 1
+        else:
+            updated += 1
+
+    return {"inserted": inserted, "updated": updated, "skipped": skipped, "errors": errors}
+
+
+def _seed_aadhaar_csv(content: bytes) -> dict:
+    text = _decode_csv_content(content)
+    reader = csv.DictReader(io.StringIO(text))
+
+    if not reader.fieldnames:
+        return {"inserted": 0, "updated": 0, "skipped": 0, "errors": ["CSV header missing"]}
+
+    inserted = 0
+    updated = 0
+    skipped = 0
+    errors = []
+
+    for line_no, row in enumerate(reader, start=2):
+        aadhaar_number = _normalize_aadhaar_number(_row_value(row, "aadhaar_number", "aadhaar", "aadhaar_no", "aadhar_number", "aadhar"))
+        name = _row_value(row, "name", "full_name", "customer_name")
+        dob = _normalize_master_dob(_row_value(row, "dob", "date_of_birth", "birth_date"))
+
+        if not aadhaar_number or not name or not dob:
+            skipped += 1
+            errors.append(f"line {line_no}: invalid aadhaar/name/dob")
+            continue
+
+        result = aadhaar_db.update_one(
+            {"aadhaar_number": aadhaar_number},
+            {"$set": {"aadhaar_number": aadhaar_number, "name": name.upper(), "dob": dob}},
+            upsert=True,
+        )
+        if result.upserted_id is not None:
+            inserted += 1
+        else:
+            updated += 1
+
+    return {"inserted": inserted, "updated": updated, "skipped": skipped, "errors": errors}
+
+
 @app.get("/")
 def home():
     return {"message": "KYC Verification API Running"}
+
+
+@app.post("/admin/seed-master-data")
+async def seed_master_data(
+    pan_file: UploadFile | None = File(default=None),
+    aadhaar_file: UploadFile | None = File(default=None),
+):
+    if not pan_file and not aadhaar_file:
+        return {"ok": False, "error": "no_files_uploaded"}
+
+    response = {"ok": True, "pan": None, "aadhaar": None}
+
+    if pan_file:
+        pan_content = await pan_file.read()
+        response["pan"] = _seed_pan_csv(pan_content)
+
+    if aadhaar_file:
+        aadhaar_content = await aadhaar_file.read()
+        response["aadhaar"] = _seed_aadhaar_csv(aadhaar_content)
+
+    return response
 
 
 @app.get("/kyc/status")
@@ -62,6 +212,8 @@ def kyc_status(user_id: str):
 @app.post("/upload-pan")
 async def upload_pan(user_id: str, file: UploadFile = File(...)):
 
+    print(f"PAN upload started | user_id={user_id} | filename={file.filename}")
+
     os.makedirs("uploads/pan", exist_ok=True)
 
     path = f"uploads/pan/{user_id}_{file.filename}"
@@ -71,24 +223,39 @@ async def upload_pan(user_id: str, file: UploadFile = File(...)):
 
     text = extract_text(path)
 
-    pan_number = extract_pan(text)
+    pan_number = (extract_pan(text) or "").upper() or None
     name = extract_name(text)
     dob = extract_dob(text)
 
-    print("OCR PAN:", pan_number)
-    print("OCR NAME:", name)
-    print("OCR DOB:", dob)
+    # Retry extraction using multiple OCR variants if primary pass misses PAN.
+    if not pan_number:
+        try:
+            for candidate_text in extract_text_candidates(path):
+                cand_pan = (extract_pan(candidate_text) or "").upper() or None
+                if cand_pan:
+                    pan_number = cand_pan
+                    name = name or extract_name(candidate_text)
+                    dob = dob or extract_dob(candidate_text)
+                    break
+        except Exception:
+            pass
 
-    record = pan_db.find_one({"pan_number": pan_number})
+    print(f"PAN OCR result | user_id={user_id} | filename={file.filename} | pan={pan_number} | name={name} | dob={dob}")
+
+    if not pan_number:
+        return {"verified": False, "error": "pan_not_detected"}
+
+    pan_lookup_pattern = f"^{pan_number[:5]}[\\s\\-]*{pan_number[5:9]}[\\s\\-]*{pan_number[9]}$"
+    record = pan_db.find_one({"pan_number": {"$regex": pan_lookup_pattern, "$options": "i"}})
 
     if not record:
         return {"verified": False, "error": "pan_not_found"}
 
-    db_name = record["name"]
-    db_dob = record["dob"]
+    db_name = record.get("name")
+    db_dob = record.get("dob")
 
     pan_match = True
-    name_match = name and name.upper() == db_name.upper()
+    name_match = _names_match(name, db_name)
 
     ocr_date = normalize_ocr_date(dob)
     db_date = datetime.strptime(db_dob, "%Y-%m-%d").date()
@@ -116,8 +283,18 @@ async def upload_pan(user_id: str, file: UploadFile = File(...)):
         upsert=True
     )
 
+    error = None
+    if not verified:
+        if not name_match:
+            error = "name_mismatch"
+        elif not dob_match:
+            error = "dob_mismatch"
+        else:
+            error = "pan_verification_failed"
+
     return {
         "verified": verified,
+        "error": error,
         "checks": {
             "pan_match": pan_match,
             "name_match": name_match,
@@ -131,6 +308,8 @@ async def upload_pan(user_id: str, file: UploadFile = File(...)):
 @app.post("/upload-aadhaar")
 async def upload_aadhaar(user_id: str, file: UploadFile = File(...)):
 
+    print(f"Aadhaar upload started | user_id={user_id} | filename={file.filename}")
+
     os.makedirs("uploads/aadhaar", exist_ok=True)
 
     path = f"uploads/aadhaar/{user_id}_{file.filename}"
@@ -140,30 +319,37 @@ async def upload_aadhaar(user_id: str, file: UploadFile = File(...)):
 
     text = extract_text(path)
 
-    print("\n===== OCR TEXT =====")
-    print(text)
-    print("====================")
-
     aadhaar_number = extract_aadhaar(text)
     name = extract_name(text)
     dob = extract_dob(text)
 
-    print("OCR AADHAAR:", aadhaar_number)
-    print("OCR NAME:", name)
-    print("OCR DOB:", dob)
+    if not aadhaar_number:
+        try:
+            for candidate_text in extract_text_candidates(path):
+                cand_aadhaar = extract_aadhaar(candidate_text)
+                if cand_aadhaar:
+                    aadhaar_number = cand_aadhaar
+                    name = name or extract_name(candidate_text)
+                    dob = dob or extract_dob(candidate_text)
+                    break
+        except Exception:
+            pass
+
+    print(f"Aadhaar OCR result | user_id={user_id} | filename={file.filename} | aadhaar={aadhaar_number} | name={name} | dob={dob}")
 
     if not aadhaar_number:
         return {"verified": False, "error": "aadhaar_not_detected"}
 
-    record = aadhaar_db.find_one({"aadhaar_number": aadhaar_number})
+    aadhaar_lookup_pattern = f"^{aadhaar_number[0:4]}[\\s\\-]*{aadhaar_number[4:8]}[\\s\\-]*{aadhaar_number[8:12]}$"
+    record = aadhaar_db.find_one({"aadhaar_number": {"$regex": aadhaar_lookup_pattern, "$options": "i"}})
 
     if not record:
         return {"verified": False, "error": "aadhaar_not_found"}
 
-    db_name = record["name"]
-    db_dob = record["dob"]
+    db_name = record.get("name")
+    db_dob = record.get("dob")
 
-    name_match = name and name.upper() == db_name.upper()
+    name_match = _names_match(name, db_name)
 
     ocr_date = normalize_ocr_date(dob)
     db_date = datetime.strptime(db_dob, "%Y-%m-%d").date()
@@ -194,8 +380,18 @@ async def upload_aadhaar(user_id: str, file: UploadFile = File(...)):
         upsert=True
     )
 
+    error = None
+    if not verified:
+        if not name_match:
+            error = "name_mismatch"
+        elif not dob_match:
+            error = "dob_mismatch"
+        else:
+            error = "aadhaar_verification_failed"
+
     return {
         "verified": verified,
+        "error": error,
         "aadhaar_number": aadhaar_number,
         "checks": {
             "aadhaar_match": aadhaar_match,
@@ -210,6 +406,8 @@ async def upload_aadhaar(user_id: str, file: UploadFile = File(...)):
 @app.post("/upload-selfie")
 async def upload_selfie(user_id: str, file: UploadFile = File(...)):
 
+    print(f"Selfie upload started | user_id={user_id} | filename={file.filename}")
+
     os.makedirs("uploads/selfie", exist_ok=True)
 
     selfie_path = f"uploads/selfie/{user_id}_{file.filename}"
@@ -222,12 +420,19 @@ async def upload_selfie(user_id: str, file: UploadFile = File(...)):
     if not kyc_record or "aadhaar" not in kyc_record:
         return {"verified": False, "error": "aadhaar_not_uploaded"}
 
-    aadhaar_path = kyc_record["aadhaar"]["image_path"]
+    aadhaar_path = kyc_record.get("aadhaar", {}).get("image_path")
+    if not aadhaar_path or not os.path.exists(aadhaar_path):
+        return {"verified": False, "error": "aadhaar_image_missing"}
 
     result = verify_faces(aadhaar_path, selfie_path)
 
     face_verified = result["verified"]
     similarity = result.get("distance")
+    face_error = result.get("error")
+
+    print(
+        f"Selfie verification result | user_id={user_id} | aadhaar_path={aadhaar_path} | selfie_path={selfie_path} | verified={face_verified} | similarity={similarity} | error={face_error}"
+    )
 
     kyc_db.update_one(
         {"user_id": user_id},
@@ -235,7 +440,8 @@ async def upload_selfie(user_id: str, file: UploadFile = File(...)):
             "$set": {
                 "face": {
                     "verified": face_verified,
-                    "similarity": similarity
+                    "similarity": similarity,
+                    "error": face_error
                 }
             }
         }
@@ -243,7 +449,8 @@ async def upload_selfie(user_id: str, file: UploadFile = File(...)):
 
     return {
         "verified": face_verified,
-        "similarity_score": similarity
+        "similarity_score": similarity,
+        "error": face_error
     }
 
 # ------------------------------------------------
