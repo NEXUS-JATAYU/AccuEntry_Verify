@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebRTC Live Video Test</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        .video-container { display: flex; gap: 20px; margin-top: 20px; }
+        video { width: 320px; height: 240px; background: #222; border-radius: 8px; }
+        .controls { margin-bottom: 20px; padding: 15px; background: #f0f0f0; border-radius: 8px; display: inline-block; }
+        button { padding: 8px 16px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h2>Live KYC Video Call Test</h2>
+    
+    <div class="controls">
+        <label><b>Role: </b></label>
+        <select id="role">
+            <option value="user">User (Customer)</option>
+            <option value="agent">Agent (KYC Verifier)</option>
+        </select>
+        <br><br>
+        <button onclick="connectSocket()">1. Join Room & Start Camera</button>
+        <button id="callBtn" onclick="makeOffer()" disabled>2. Start Call</button>
+    </div>
+
+    <div class="video-container">
+        <div>
+            <h3>Local (You)</h3>
+            <video id="localVideo" autoplay muted playsinline></video>
+        </div>
+        <div>
+            <h3>Remote (Them)</h3>
+            <video id="remoteVideo" autoplay playsinline></video>
+        </div>
+    </div>
+
+    <script>
+        let ws;
+        let pc;
+        let localStream;
+        const roomId = "ROOM-101"; 
+
+        const configuration = {'iceServers': [{'urls': 'stun:stun.l.google.com:19302'}]};
+
+        async function connectSocket() {
+            const role = document.getElementById("role").value;
+            
+            // Connect to our new FastAPI signaling server endpoint
+            ws = new WebSocket(`ws://localhost:8000/ws/signaling/${roomId}/${role}`);
+            
+            pc = new RTCPeerConnection(configuration);
+
+            // Send network candidates to the other peer via the signaling server
+            pc.onicecandidate = event => {
+                if(event.candidate) {
+                    ws.send(JSON.stringify({'type': 'candidate', 'candidate': event.candidate}));
+                }
+            };
+
+            // When the remote video track arrives, show it!
+            pc.ontrack = event => {
+                document.getElementById('remoteVideo').srcObject = event.streams[0];
+            };
+
+            // Get local camera & mic
+            localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
+            document.getElementById('localVideo').srcObject = localStream;
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+            // Handle messages coming from the backend server
+            ws.onmessage = async (event) => {
+                const message = JSON.parse(event.data);
+                
+                if(message.type === 'offer') {
+                    console.log("Received Offer");
+                    await pc.setRemoteDescription(new RTCSessionDescription(message));
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    ws.send(JSON.stringify(pc.localDescription)); // send answer back
+                
+                } else if(message.type === 'answer') {
+                    console.log("Received Answer");
+                    await pc.setRemoteDescription(new RTCSessionDescription(message));
+                
+                } else if(message.type === 'candidate') {
+                    console.log("Received ICE Candidate");
+                    try { await pc.addIceCandidate(new RTCIceCandidate(message.candidate)); } catch (e) {}
+                
+                } else if(message.type === 'disconnect') {
+                    console.log("The other party disconnected");
+                    document.getElementById('remoteVideo').srcObject = null;
+                }
+            };
+
+            ws.onopen = () => {
+                console.log("Connected to Signaling Server as", role);
+                document.getElementById('callBtn').disabled = false;
+            };
+        }
+
+        // Function called when "Start Call" button is pressed to initiate connection
+        async function makeOffer() {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify(pc.localDescription)); // send offer
+        }
+    </script>
+</body>
+</html>
