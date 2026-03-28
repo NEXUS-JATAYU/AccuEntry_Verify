@@ -1,8 +1,10 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
 import shutil
 import os
+import json
 from datetime import datetime
-from app.face_service import verify_faces
+from app.face_service import verify_live_video, verify_faces
+from app.webrtc_service import manager
 
 from app.database import pan_db, aadhaar_db, kyc_db
 from app.ocr_service import (
@@ -20,6 +22,24 @@ app = FastAPI()
 @app.get("/")
 def home():
     return {"message": "KYC Verification API Running"}
+
+# ------------------------------------------------
+# LIVE VERIFICATION SIGNALING API (WebRTC)
+# ------------------------------------------------
+@app.websocket("/ws/signaling/{room_id}/{client_id}")
+async def websocket_signaling(websocket: WebSocket, room_id: str, client_id: str):
+    await manager.connect(room_id, client_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                message = json.loads(data)
+                await manager.broadcast(room_id, message, sender_id=client_id)
+            except json.JSONDecodeError:
+                pass
+    except WebSocketDisconnect:
+        manager.disconnect(room_id, client_id)
+        await manager.broadcast(room_id, {"type": "disconnect", "client_id": client_id}, sender_id=client_id)
 
 
 # ------------------------------------------------
@@ -193,7 +213,7 @@ async def upload_selfie(user_id: str, file: UploadFile = File(...)):
     result = verify_faces(aadhaar_path, selfie_path)
 
     face_verified = result["verified"]
-    similarity = result.get("distance")
+    similarity = result.get("distance", 0.0)
 
     kyc_db.update_one(
         {"user_id": user_id},
@@ -210,6 +230,50 @@ async def upload_selfie(user_id: str, file: UploadFile = File(...)):
     return {
         "verified": face_verified,
         "similarity_score": similarity
+    }
+
+# ------------------------------------------------
+# LIVE KYC VERIFICATION API (Video Liveness)
+# ------------------------------------------------
+@app.post("/live-kyc")
+async def live_kyc(user_id: str, file: UploadFile = File(...)):
+    os.makedirs("uploads/live_kyc", exist_ok=True)
+    video_path = f"uploads/live_kyc/{user_id}_{file.filename}"
+    with open(video_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    kyc_record = kyc_db.find_one({"user_id": user_id})
+    if not kyc_record or "aadhaar" not in kyc_record:
+        return {"verified": False, "error": "aadhaar_not_uploaded"}
+
+    aadhaar_path = kyc_record["aadhaar"]["image_path"]
+
+    result = verify_live_video(aadhaar_path, video_path)
+
+    face_verified = result["verified"]
+    similarity = result.get("distance", 0.0)
+    is_real = result.get("is_real", True)
+
+    final_verified = face_verified and is_real
+
+    kyc_db.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "live_video_checks": {
+                    "verified": final_verified,
+                    "similarity": similarity,
+                    "is_real": is_real,
+                    "face_match": face_verified,
+                    "anti_spoofing": is_real
+                }
+            }
+        }
+    )
+    return {
+        "verified": final_verified,
+        "similarity_score": similarity,
+        "is_real": is_real
     }
 
 # ------------------------------------------------
