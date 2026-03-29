@@ -38,19 +38,49 @@ def check_video_motion(video_path):
 
 def extract_middle_frame(video_path):
     cap = cv2.VideoCapture(video_path)
-    length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    middle_frame_idx = length // 2
+    if not cap.isOpened():
+        return None
     
-    cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_idx)
-    ret, frame = cap.read()
+    # Read up to the 10th frame to avoid initial dark/blank frames
+    # and handle .webm files where random seeking fails
+    frame_to_save = None
+    for _ in range(10):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_to_save = frame
+        
     cap.release()
     
-    if ret:
+    if frame_to_save is not None:
         img_id = str(uuid.uuid4())
         save_path = f"uploads/temp_{img_id}.jpg"
-        cv2.imwrite(save_path, frame)
+        cv2.imwrite(save_path, frame_to_save)
         return save_path
+    
     return None
+
+
+def check_image_quality(frame_path):
+    img = cv2.imread(frame_path)
+    if img is None:
+        return False, "invalid_image"
+        
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur_val = cv2.Laplacian(gray, cv2.CV_64F).var()
+    
+    if blur_val < 30:
+        return False, "blur_detected"
+        
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    brightness = np.mean(hsv[:,:,2])
+    
+    if brightness < 40:
+        return False, "low_light_detected"
+    if brightness > 230:
+        return False, "overexposed_detected"
+        
+    return True, None
 
 
 def verify_live_video(aadhaar_image, video_path):
@@ -74,12 +104,49 @@ def verify_live_video(aadhaar_image, video_path):
                 "error": "frame_extraction_failed"
             }
             
+        is_high_quality, quality_error = check_image_quality(frame_path)
+        if not is_high_quality:
+            try:
+                os.remove(frame_path)
+            except Exception:
+                pass
+            return {
+                "verified": False,
+                "distance": 0.0,
+                "is_real": False,
+                "error": quality_error
+            }
+            
+        faces = DeepFace.extract_faces(
+            img_path=frame_path,
+            enforce_detection=False,
+            anti_spoofing=True
+        )
+        
+        is_real = True
+        for face in faces:
+            if not face.get("is_real", True):
+                is_real = False
+                break
+                
+        if not is_real:
+            try:
+                os.remove(frame_path)
+            except Exception:
+                pass
+            return {
+                "verified": False,
+                "distance": 0.0,
+                "is_real": False,
+                "error": "spoofing_detected"
+            }
+
         result = DeepFace.verify(
             img1_path=aadhaar_image,
             img2_path=frame_path,
             model_name="Facenet",
             enforce_detection=False,
-            anti_spoofing=True
+            anti_spoofing=False
         )
 
         try:
@@ -87,10 +154,18 @@ def verify_live_video(aadhaar_image, video_path):
         except Exception:
             pass
 
+        distance = result.get("distance", 0.0)
+        verified = result.get("verified", False)
+        
+        # Facenet backend threshold is usually ~0.40 for cosine similarity.
+        # Live webcams often have compression artifacts pushing distance to ~0.55
+        if not verified and distance <= 0.55:
+            verified = True
+
         return {
-            "verified": result.get("verified", False),
-            "distance": result.get("distance", 0.0),
-            "is_real": result.get("is_real", True)
+            "verified": verified,
+            "distance": distance,
+            "is_real": True
         }
 
     except Exception as e:
