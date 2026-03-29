@@ -195,14 +195,17 @@ def kyc_status(user_id: str):
     pan_v = bool(kyc.get("pan", {}).get("verified", False))
     aadhaar_v = bool(kyc.get("aadhaar", {}).get("verified", False))
     face_v = bool(kyc.get("face", {}).get("verified", False))
+    video_kyc_v = bool(kyc.get("video_kyc", {}).get("verified", False))
 
     return {
         "pan_verified": pan_v,
         "aadhaar_verified": aadhaar_v,
         "face_verified": face_v,
+        "video_kyc_verified": video_kyc_v,
         "pan_failed": failed("pan"),
         "aadhaar_failed": failed("aadhaar"),
         "face_failed": failed("face"),
+        "video_kyc_failed": failed("video_kyc"),
     }
 
 
@@ -441,7 +444,8 @@ async def upload_selfie(user_id: str, file: UploadFile = File(...)):
                 "face": {
                     "verified": face_verified,
                     "similarity": similarity,
-                    "error": face_error
+                    "error": face_error,
+                    "image_path": selfie_path
                 }
             }
         }
@@ -452,6 +456,53 @@ async def upload_selfie(user_id: str, file: UploadFile = File(...)):
         "similarity_score": similarity,
         "error": face_error
     }
+
+
+# ------------------------------------------------
+# VIDEO KYC VERIFICATION API
+# ------------------------------------------------
+@app.post("/upload-video-kyc")
+async def upload_video_kyc(user_id: str, file: UploadFile = File(...)):
+
+    print(f"Video KYC upload started | user_id={user_id} | filename={file.filename}")
+
+    os.makedirs("uploads/video_kyc", exist_ok=True)
+    video_path = f"uploads/video_kyc/{user_id}_{file.filename}"
+
+    with open(video_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    kyc_record = kyc_db.find_one({"user_id": user_id})
+
+    if not kyc_record or "face" not in kyc_record:
+        return {"verified": False, "error": "selfie_not_uploaded"}
+
+    selfie_path = kyc_record.get("face", {}).get("image_path")
+    if not selfie_path or not os.path.exists(selfie_path):
+        return {"verified": False, "error": "selfie_image_missing"}
+
+    from app.face_service import verify_live_video
+    result = verify_live_video(selfie_path, video_path)
+
+    verified = result.get("verified", False)
+    
+    print(f"Video KYC verification result | user_id={user_id} | verified={verified} | is_real={result.get('is_real')}")
+
+    kyc_db.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "video_kyc": {
+                    "verified": verified,
+                    "is_real": result.get("is_real", False),
+                    "distance": result.get("distance", 0.0),
+                    "error": result.get("error")
+                }
+            }
+        }
+    )
+
+    return result
 
 # ------------------------------------------------
 # APPROVE KYC API
