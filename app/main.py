@@ -23,6 +23,41 @@ app = FastAPI()
 def home():
     return {"message": "KYC Verification API Running"}
 
+@app.get("/kyc/status")
+def kyc_status(user_id: str):
+    kyc = kyc_db.find_one({"user_id": user_id})
+    if not kyc:
+        return {
+            "pan_verified": False,
+            "aadhaar_verified": False,
+            "face_verified": False,
+            "pan_failed": False,
+            "aadhaar_failed": False,
+            "face_failed": False,
+        }
+
+    def failed(section: str) -> bool:
+        sub = kyc.get(section)
+        if sub is None:
+            return False
+        return not bool(sub.get("verified", False))
+
+    pan_v = bool(kyc.get("pan", {}).get("verified", False))
+    aadhaar_v = bool(kyc.get("aadhaar", {}).get("verified", False))
+    face_v = bool(kyc.get("face", {}).get("verified", False))
+    video_kyc_v = bool(kyc.get("video_kyc", {}).get("verified", False))
+
+    return {
+        "pan_verified": pan_v,
+        "aadhaar_verified": aadhaar_v,
+        "face_verified": face_v,
+        "video_kyc_verified": video_kyc_v,
+        "pan_failed": failed("pan"),
+        "aadhaar_failed": failed("aadhaar"),
+        "face_failed": failed("face"),
+        "video_kyc_failed": failed("video_kyc"),
+    }
+
 # ------------------------------------------------
 # LIVE VERIFICATION SIGNALING API (WebRTC)
 # ------------------------------------------------
@@ -46,7 +81,7 @@ async def websocket_signaling(websocket: WebSocket, room_id: str, client_id: str
 # PAN VERIFICATION API
 # ------------------------------------------------
 @app.post("/upload-pan")
-async def upload_pan(user_id: str, file: UploadFile = File(...)):
+async def upload_pan(user_id: str, expected_name: str = None, file: UploadFile = File(...)):
 
     os.makedirs("uploads/pan", exist_ok=True)
 
@@ -73,8 +108,17 @@ async def upload_pan(user_id: str, file: UploadFile = File(...)):
     db_name = record["name"]
     db_dob = record["dob"]
 
+    def normalize(val): return "".join(c for c in (val or "").upper() if c.isalpha())
+    clean_ocr = normalize(name)
+    clean_db = normalize(db_name)
+
     pan_match = True
-    name_match = name and name.upper() == db_name.upper()
+    name_match = clean_ocr and clean_db and (clean_db in clean_ocr or clean_ocr in clean_db)
+
+    if expected_name:
+        clean_expected = normalize(expected_name)
+        user_name_match = clean_ocr and clean_expected and (clean_expected in clean_ocr or clean_ocr in clean_expected)
+        name_match = name_match and user_name_match
 
     ocr_date = normalize_ocr_date(dob)
     db_date = datetime.strptime(db_dob, "%Y-%m-%d").date()
@@ -115,7 +159,7 @@ async def upload_pan(user_id: str, file: UploadFile = File(...)):
 # AADHAAR VERIFICATION API
 # ------------------------------------------------
 @app.post("/upload-aadhaar")
-async def upload_aadhaar(user_id: str, file: UploadFile = File(...)):
+async def upload_aadhaar(user_id: str, expected_name: str = None, file: UploadFile = File(...)):
 
     os.makedirs("uploads/aadhaar", exist_ok=True)
 
@@ -149,7 +193,16 @@ async def upload_aadhaar(user_id: str, file: UploadFile = File(...)):
     db_name = record["name"]
     db_dob = record["dob"]
 
-    name_match = name and name.upper() == db_name.upper()
+    def normalize(val): return "".join(c for c in (val or "").upper() if c.isalpha())
+    clean_ocr = normalize(name)
+    clean_db = normalize(db_name)
+
+    name_match = clean_ocr and clean_db and (clean_db in clean_ocr or clean_ocr in clean_db)
+
+    if expected_name:
+        clean_expected = normalize(expected_name)
+        user_name_match = clean_ocr and clean_expected and (clean_expected in clean_ocr or clean_ocr in clean_expected)
+        name_match = name_match and user_name_match
 
     ocr_date = normalize_ocr_date(dob)
     db_date = datetime.strptime(db_dob, "%Y-%m-%d").date()

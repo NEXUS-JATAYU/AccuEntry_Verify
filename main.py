@@ -213,7 +213,7 @@ def kyc_status(user_id: str):
 # PAN VERIFICATION API
 # ------------------------------------------------
 @app.post("/upload-pan")
-async def upload_pan(user_id: str, file: UploadFile = File(...)):
+async def upload_pan(user_id: str, expected_name: str = None, file: UploadFile = File(...)):
 
     print(f"PAN upload started | user_id={user_id} | filename={file.filename}")
 
@@ -259,6 +259,10 @@ async def upload_pan(user_id: str, file: UploadFile = File(...)):
 
     pan_match = True
     name_match = _names_match(name, db_name)
+
+    if expected_name:
+        user_name_match = _names_match(name, expected_name)
+        name_match = name_match and user_name_match
 
     ocr_date = normalize_ocr_date(dob)
     db_date = datetime.strptime(db_dob, "%Y-%m-%d").date()
@@ -309,7 +313,7 @@ async def upload_pan(user_id: str, file: UploadFile = File(...)):
 # AADHAAR VERIFICATION API
 # ------------------------------------------------
 @app.post("/upload-aadhaar")
-async def upload_aadhaar(user_id: str, file: UploadFile = File(...)):
+async def upload_aadhaar(user_id: str, expected_name: str = None, file: UploadFile = File(...)):
 
     print(f"Aadhaar upload started | user_id={user_id} | filename={file.filename}")
 
@@ -353,6 +357,10 @@ async def upload_aadhaar(user_id: str, file: UploadFile = File(...)):
     db_dob = record.get("dob")
 
     name_match = _names_match(name, db_name)
+
+    if expected_name:
+        user_name_match = _names_match(name, expected_name)
+        name_match = name_match and user_name_match
 
     ocr_date = normalize_ocr_date(dob)
     db_date = datetime.strptime(db_dob, "%Y-%m-%d").date()
