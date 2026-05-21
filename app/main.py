@@ -100,34 +100,23 @@ async def upload_pan(user_id: str, expected_name: str = None, file: UploadFile =
     print("OCR NAME:", name)
     print("OCR DOB:", dob)
 
-    record = pan_db.find_one({"pan_number": pan_number})
-
-    if not record:
-        return {"verified": False, "error": "pan_not_found"}
-
-    db_name = record["name"]
-    db_dob = record["dob"]
-
     def normalize(val): return "".join(c for c in (val or "").upper() if c.isalpha())
     clean_ocr = normalize(name)
-    clean_db = normalize(db_name)
-
     pan_match = True
-    name_match = clean_ocr and clean_db and (clean_db in clean_ocr or clean_ocr in clean_db)
+    name_match = bool(clean_ocr)
 
     if expected_name:
         clean_expected = normalize(expected_name)
         user_name_match = clean_ocr and clean_expected and (clean_expected in clean_ocr or clean_ocr in clean_expected)
-        name_match = name_match and user_name_match
+        name_match = bool(user_name_match)
 
     ocr_date = normalize_ocr_date(dob)
-    db_date = datetime.strptime(db_dob, "%Y-%m-%d").date()
 
-    dob_match = ocr_date == db_date
+    dob_match = bool(ocr_date)
 
     verified = pan_match and name_match and dob_match
 
-    # SAVE IN KYC RECORD
+    # SAVE IN USER-SCOPED KYC RECORD
     kyc_db.update_one(
         {"user_id": user_id},
         {
@@ -144,6 +133,28 @@ async def upload_pan(user_id: str, expected_name: str = None, file: UploadFile =
             }
         },
         upsert=True
+    )
+
+    pan_db.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "user_id": user_id,
+                "pan_number": pan_number,
+                "name": name,
+                "dob": dob,
+                "expected_name": expected_name,
+                "verified": verified,
+                "checks": {
+                    "pan_match": pan_match,
+                    "name_match": name_match,
+                    "dob_match": dob_match,
+                },
+                "image_path": path,
+                "updated_at": datetime.utcnow(),
+            }
+        },
+        upsert=True,
     )
 
     return {
@@ -185,29 +196,18 @@ async def upload_aadhaar(user_id: str, expected_name: str = None, file: UploadFi
     if not aadhaar_number:
         return {"verified": False, "error": "aadhaar_not_detected"}
 
-    record = aadhaar_db.find_one({"aadhaar_number": aadhaar_number})
-
-    if not record:
-        return {"verified": False, "error": "aadhaar_not_found"}
-
-    db_name = record["name"]
-    db_dob = record["dob"]
-
     def normalize(val): return "".join(c for c in (val or "").upper() if c.isalpha())
     clean_ocr = normalize(name)
-    clean_db = normalize(db_name)
-
-    name_match = clean_ocr and clean_db and (clean_db in clean_ocr or clean_ocr in clean_db)
+    name_match = bool(clean_ocr)
 
     if expected_name:
         clean_expected = normalize(expected_name)
         user_name_match = clean_ocr and clean_expected and (clean_expected in clean_ocr or clean_ocr in clean_expected)
-        name_match = name_match and user_name_match
+        name_match = bool(user_name_match)
 
     ocr_date = normalize_ocr_date(dob)
-    db_date = datetime.strptime(db_dob, "%Y-%m-%d").date()
 
-    dob_match = ocr_date == db_date
+    dob_match = bool(ocr_date)
 
     aadhaar_match = True
 
@@ -231,6 +231,28 @@ async def upload_aadhaar(user_id: str, expected_name: str = None, file: UploadFi
             }
         },
         upsert=True
+    )
+
+    aadhaar_db.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "user_id": user_id,
+                "aadhaar_number": aadhaar_number,
+                "name": name,
+                "dob": dob,
+                "expected_name": expected_name,
+                "verified": verified,
+                "checks": {
+                    "aadhaar_match": aadhaar_match,
+                    "name_match": name_match,
+                    "dob_match": dob_match,
+                },
+                "image_path": path,
+                "updated_at": datetime.utcnow(),
+            }
+        },
+        upsert=True,
     )
 
     return {
