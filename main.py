@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import Depends, FastAPI, UploadFile, File
 import shutil
 import os
 import re
@@ -8,6 +8,12 @@ from datetime import datetime
 from app.face_service import verify_faces
 
 from app.database import pan_db, aadhaar_db, kyc_db
+from app.security import (
+    sanitize_agent_id,
+    sanitize_reject_reason,
+    sanitize_user_id,
+    verify_service_key,
+)
 from app.ocr_service import (
     extract_text,
     extract_text_candidates,
@@ -559,7 +565,13 @@ async def upload_video_kyc(user_id: str, file: UploadFile = File(...)):
 # APPROVE KYC API
 # ------------------------------------------------
 @app.post("/agent/approve-kyc")
-def approve_kyc(user_id: str, agent_id: str):
+def approve_kyc(
+    user_id: str,
+    agent_id: str,
+    _: None = Depends(verify_service_key),
+):
+    user_id = sanitize_user_id(user_id)
+    agent_id = sanitize_agent_id(agent_id)
 
     kyc = kyc_db.find_one({"user_id": user_id})
 
@@ -594,7 +606,15 @@ def approve_kyc(user_id: str, agent_id: str):
     }
 
 @app.post("/agent/reject-kyc")
-def reject_kyc(user_id: str, agent_id: str, reason: str):
+def reject_kyc(
+    user_id: str,
+    agent_id: str,
+    reason: str,
+    _: None = Depends(verify_service_key),
+):
+    user_id = sanitize_user_id(user_id)
+    agent_id = sanitize_agent_id(agent_id)
+    reason = sanitize_reject_reason(reason)
 
     kyc_db.update_one(
         {"user_id": user_id},
@@ -616,7 +636,7 @@ def reject_kyc(user_id: str, agent_id: str, reason: str):
     }
 
 @app.get("/agent/pending-kyc")
-def get_pending_kyc():
+def get_pending_kyc(_: None = Depends(verify_service_key)):
 
     records = list(
         kyc_db.find({"kyc_status": "pending_agent_review"}, {"_id": 0})
