@@ -5,6 +5,9 @@ import os
 from deepface import DeepFace
 
 
+LIVE_VIDEO_FACE_DISTANCE_THRESHOLD = 0.60
+
+
 def check_video_motion(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -158,8 +161,10 @@ def verify_live_video(aadhaar_image, video_path):
         verified = result.get("verified", False)
         
         # Facenet backend threshold is usually ~0.40 for cosine similarity.
-        # Live webcams often have compression artifacts pushing distance to ~0.55
-        if not verified and distance <= 0.55:
+        # Live webcams often have compression artifacts pushing distance above that.
+        # Keep a slightly more tolerant fallback so genuine users are not rejected
+        # by a tiny margin.
+        if not verified and distance <= LIVE_VIDEO_FACE_DISTANCE_THRESHOLD:
             verified = True
 
         return {
@@ -191,4 +196,4 @@ def verify_faces(aadhaar_image, selfie_image):
         return {
             "verified": False,
             "error": str(e)
-        }
+        }

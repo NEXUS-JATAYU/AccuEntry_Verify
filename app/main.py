@@ -19,6 +19,99 @@ from app.ocr_service import (
 app = FastAPI()
 
 
+def _normalize_name(value: str | None) -> str:
+    return " ".join(
+        chunk for chunk in "".join(c if c.isalpha() else " " for c in (value or "").upper()).split() if chunk
+    )
+
+
+def _normalize_dob(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return normalize_ocr_date(value).isoformat()
+    except Exception:
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+        except Exception:
+            return None
+
+
+def _names_match(left: str | None, right: str | None) -> bool:
+    clean_left = _normalize_name(left)
+    clean_right = _normalize_name(right)
+    if not clean_left or not clean_right:
+        return False
+    return clean_left == clean_right or clean_left in clean_right or clean_right in clean_left
+
+
+def _lookup_pan_master(pan_number: str | None, name: str | None, dob: str | None) -> dict | None:
+    candidates = []
+    if pan_number:
+        candidates.append(pan_db.find_one({"pan_number": pan_number}, {"_id": 0}))
+    normalized_name = _normalize_name(name)
+    normalized_dob = _normalize_dob(dob)
+    if normalized_name and normalized_dob:
+        candidates.append(pan_db.find_one({"name": normalized_name, "dob": normalized_dob}, {"_id": 0}))
+    for candidate in candidates:
+        if candidate:
+            return candidate
+    return None
+
+
+def _extract_document_fields(kyc: dict) -> dict[str, str | None]:
+    """OCR/master identity fields for downstream fraud Layer 3 (never raises)."""
+    document_name: str | None = None
+    document_dob: str | None = None
+    document_address: str | None = None
+    try:
+        pan = kyc.get("pan") if isinstance(kyc.get("pan"), dict) else {}
+        aadhaar = kyc.get("aadhaar") if isinstance(kyc.get("aadhaar"), dict) else {}
+
+        for section in (aadhaar, pan):
+            master = section.get("matched_master_record")
+            if not isinstance(master, dict):
+                continue
+            if not document_name and master.get("name"):
+                document_name = str(master["name"]).strip() or None
+            if not document_dob and master.get("dob") is not None:
+                document_dob = _normalize_dob(str(master.get("dob")))
+            if not document_address and master.get("address"):
+                document_address = str(master["address"]).strip() or None
+    except Exception:
+        pass
+
+    return {
+        "document_name": document_name,
+        "document_dob": document_dob,
+        "document_address": document_address,
+    }
+
+
+def _section_failed(kyc: dict, section: str) -> bool:
+    """True only when a doc was uploaded and explicitly not verified."""
+    sub = kyc.get(section)
+    if not isinstance(sub, dict) or not sub:
+        return False
+    if "verified" not in sub:
+        return False
+    return sub.get("verified") is False
+
+
+def _lookup_aadhaar_master(aadhaar_number: str | None, name: str | None, dob: str | None) -> dict | None:
+    candidates = []
+    if aadhaar_number:
+        candidates.append(aadhaar_db.find_one({"aadhaar_number": aadhaar_number}, {"_id": 0}))
+    normalized_name = _normalize_name(name)
+    normalized_dob = _normalize_dob(dob)
+    if normalized_name and normalized_dob:
+        candidates.append(aadhaar_db.find_one({"name": normalized_name, "dob": normalized_dob}, {"_id": 0}))
+    for candidate in candidates:
+        if candidate:
+            return candidate
+    return None
+
+
 @app.get("/")
 def home():
     return {"message": "KYC Verification API Running"}
@@ -31,31 +124,32 @@ def kyc_status(user_id: str):
             "pan_verified": False,
             "aadhaar_verified": False,
             "face_verified": False,
+            "video_kyc_verified": False,
             "pan_failed": False,
             "aadhaar_failed": False,
             "face_failed": False,
+            "video_kyc_failed": False,
+            "document_name": None,
+            "document_dob": None,
+            "document_address": None,
         }
 
-    def failed(section: str) -> bool:
-        sub = kyc.get(section)
-        if sub is None:
-            return False
-        return not bool(sub.get("verified", False))
+    pan_v = bool((kyc.get("pan") or {}).get("verified"))
+    aadhaar_v = bool((kyc.get("aadhaar") or {}).get("verified"))
+    face_v = bool((kyc.get("face") or {}).get("verified"))
+    video_kyc_v = bool((kyc.get("video_kyc") or {}).get("verified"))
 
-    pan_v = bool(kyc.get("pan", {}).get("verified", False))
-    aadhaar_v = bool(kyc.get("aadhaar", {}).get("verified", False))
-    face_v = bool(kyc.get("face", {}).get("verified", False))
-    video_kyc_v = bool(kyc.get("video_kyc", {}).get("verified", False))
-
+    doc_fields = _extract_document_fields(kyc)
     return {
         "pan_verified": pan_v,
         "aadhaar_verified": aadhaar_v,
         "face_verified": face_v,
         "video_kyc_verified": video_kyc_v,
-        "pan_failed": failed("pan"),
-        "aadhaar_failed": failed("aadhaar"),
-        "face_failed": failed("face"),
-        "video_kyc_failed": failed("video_kyc"),
+        "pan_failed": _section_failed(kyc, "pan"),
+        "aadhaar_failed": _section_failed(kyc, "aadhaar"),
+        "face_failed": _section_failed(kyc, "face"),
+        "video_kyc_failed": _section_failed(kyc, "video_kyc"),
+        **doc_fields,
     }
 
 # ------------------------------------------------
@@ -95,26 +189,29 @@ async def upload_pan(user_id: str, expected_name: str = None, file: UploadFile =
     pan_number = extract_pan(text)
     name = extract_name(text)
     dob = extract_dob(text)
+    normalized_ocr_dob = _normalize_dob(dob)
 
     print("OCR PAN:", pan_number)
     print("OCR NAME:", name)
     print("OCR DOB:", dob)
 
-    def normalize(val): return "".join(c for c in (val or "").upper() if c.isalpha())
-    clean_ocr = normalize(name)
-    pan_match = True
-    name_match = bool(clean_ocr)
+    master_record = _lookup_pan_master(pan_number, name, dob)
+    master_name = master_record.get("name") if master_record else None
+    master_dob = master_record.get("dob") if master_record else None
 
+    name_match = _names_match(name, master_name)
     if expected_name:
-        clean_expected = normalize(expected_name)
-        user_name_match = clean_ocr and clean_expected and (clean_expected in clean_ocr or clean_ocr in clean_expected)
-        name_match = bool(user_name_match)
+        name_match = name_match and _names_match(name, expected_name)
 
-    ocr_date = normalize_ocr_date(dob)
+    dob_match = bool(normalized_ocr_dob and master_dob and normalized_ocr_dob == master_dob)
+    pan_match = bool(pan_number and master_record and master_record.get("pan_number") == pan_number)
 
-    dob_match = bool(ocr_date)
-
-    verified = pan_match and name_match and dob_match
+    # If a master PAN record exists, use it as the ground truth for
+    # identification. Fall back to OCR-only checks only when the master
+    # dataset does not have a record for this PAN.
+    verified = bool(master_record) and name_match and (dob_match or not normalized_ocr_dob)
+    if not master_record:
+        verified = bool(pan_number) and name_match and dob_match
 
     # SAVE IN USER-SCOPED KYC RECORD
     kyc_db.update_one(
@@ -124,6 +221,7 @@ async def upload_pan(user_id: str, expected_name: str = None, file: UploadFile =
                 "pan": {
                     "number": pan_number,
                     "verified": verified,
+                    "matched_master_record": master_record,
                     "checks": {
                         "pan_match": pan_match,
                         "name_match": name_match,
@@ -145,6 +243,8 @@ async def upload_pan(user_id: str, expected_name: str = None, file: UploadFile =
                 "dob": dob,
                 "expected_name": expected_name,
                 "verified": verified,
+                "matched_master_record": master_record,
+                "matched_by": "pan_number" if pan_match else ("name_dob" if master_record else "ocr_only"),
                 "checks": {
                     "pan_match": pan_match,
                     "name_match": name_match,
@@ -188,6 +288,7 @@ async def upload_aadhaar(user_id: str, expected_name: str = None, file: UploadFi
     aadhaar_number = extract_aadhaar(text)
     name = extract_name(text)
     dob = extract_dob(text)
+    normalized_ocr_dob = _normalize_dob(dob)
 
     print("OCR AADHAAR:", aadhaar_number)
     print("OCR NAME:", name)
@@ -196,22 +297,20 @@ async def upload_aadhaar(user_id: str, expected_name: str = None, file: UploadFi
     if not aadhaar_number:
         return {"verified": False, "error": "aadhaar_not_detected"}
 
-    def normalize(val): return "".join(c for c in (val or "").upper() if c.isalpha())
-    clean_ocr = normalize(name)
-    name_match = bool(clean_ocr)
+    master_record = _lookup_aadhaar_master(aadhaar_number, name, dob)
+    master_name = master_record.get("name") if master_record else None
+    master_dob = master_record.get("dob") if master_record else None
 
+    name_match = _names_match(name, master_name)
     if expected_name:
-        clean_expected = normalize(expected_name)
-        user_name_match = clean_ocr and clean_expected and (clean_expected in clean_ocr or clean_ocr in clean_expected)
-        name_match = bool(user_name_match)
+        name_match = name_match and _names_match(name, expected_name)
 
-    ocr_date = normalize_ocr_date(dob)
+    dob_match = bool(normalized_ocr_dob and master_dob and normalized_ocr_dob == master_dob)
+    aadhaar_match = bool(aadhaar_number and master_record and master_record.get("aadhaar_number") == aadhaar_number)
 
-    dob_match = bool(ocr_date)
-
-    aadhaar_match = True
-
-    verified = aadhaar_match and name_match and dob_match
+    verified = bool(master_record) and name_match and (dob_match or not normalized_ocr_dob)
+    if not master_record:
+        verified = bool(aadhaar_number) and name_match and dob_match
 
     # store everything in KYC document
     kyc_db.update_one(
@@ -222,6 +321,7 @@ async def upload_aadhaar(user_id: str, expected_name: str = None, file: UploadFi
                     "number": aadhaar_number,
                     "verified": verified,
                     "image_path": path,
+                    "matched_master_record": master_record,
                     "checks": {
                         "aadhaar_match": aadhaar_match,
                         "name_match": name_match,
@@ -243,6 +343,8 @@ async def upload_aadhaar(user_id: str, expected_name: str = None, file: UploadFi
                 "dob": dob,
                 "expected_name": expected_name,
                 "verified": verified,
+                "matched_master_record": master_record,
+                "matched_by": "aadhaar_number" if aadhaar_match else ("name_dob" if master_record else "ocr_only"),
                 "checks": {
                     "aadhaar_match": aadhaar_match,
                     "name_match": name_match,

@@ -19,6 +19,9 @@ REQUIRE_VERIFY_SERVICE_KEY = os.getenv("REQUIRE_VERIFY_SERVICE_KEY", "false").lo
     "yes",
 }
 
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+REQUIRE_ADMIN_KEY = os.getenv("REQUIRE_ADMIN_KEY", "true").lower() in {"1", "true", "yes"}
+
 
 def sanitize_user_id(user_id: str) -> str:
     uid = (user_id or "").strip()
@@ -50,3 +53,12 @@ async def verify_service_key(
         return
     if not VERIFY_SERVICE_API_KEY or x_verify_service_key != VERIFY_SERVICE_API_KEY:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized.")
+
+
+async def verify_admin_key(
+    x_admin_api_key: Annotated[str | None, Header(alias="X-Admin-API-Key")] = None,
+) -> None:
+    if not REQUIRE_ADMIN_KEY:
+        return
+    if not ADMIN_API_KEY or x_admin_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized admin request.")
