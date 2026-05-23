@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+RUN pip install --no-cache-dir upstash-redis
 RUN pip install --no-cache-dir -r requirements.txt
 
 RUN mkdir -p uploads/pan uploads/aadhaar uploads/selfie uploads/live_kyc
