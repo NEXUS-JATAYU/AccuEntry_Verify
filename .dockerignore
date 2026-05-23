@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+__pycache__
+*.pyc
+.git
+*.md
+uploads/
+temp/
+.venv
+venv/
+env/
+DeepFace*/
+weights/

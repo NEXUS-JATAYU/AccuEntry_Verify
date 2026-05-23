@@ -1,0 +1,17 @@
+# Local Docker test — Verify on host port 9000 (same as dev uvicorn port)
+# Prerequisites: .env with MONGO_DB_URL or MONGO_URL
+
+services:
+  accuverify:
+    build: .
+    image: accuverify:local
+    ports:
+      - "9000:8080"
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      REQUIRE_VERIFY_SERVICE_KEY: ${REQUIRE_VERIFY_SERVICE_KEY:-false}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

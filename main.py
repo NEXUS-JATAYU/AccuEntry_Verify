@@ -6,7 +6,7 @@ from datetime import datetime
 from app.face_service import verify_live_video, verify_faces
 from app.webrtc_service import manager
 
-from app.security import verify_admin_key
+from app.security import verify_admin_key, verify_service_key
 from app.database import pan_db, aadhaar_db, kyc_db
 from app.ocr_service import (
     extract_text,
@@ -118,7 +118,13 @@ def _lookup_aadhaar_master(aadhaar_number: str | None, name: str | None, dob: st
 def home():
     return {"message": "KYC Verification API Running"}
 
-@app.get("/kyc/status")
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/kyc/status", dependencies=[Depends(verify_service_key)])
 def kyc_status(user_id: str):
     kyc = kyc_db.find_one({"user_id": user_id})
     if not kyc:
@@ -176,7 +182,7 @@ async def websocket_signaling(websocket: WebSocket, room_id: str, client_id: str
 # ------------------------------------------------
 # PAN VERIFICATION API
 # ------------------------------------------------
-@app.post("/upload-pan")
+@app.post("/upload-pan", dependencies=[Depends(verify_service_key)])
 async def upload_pan(user_id: str, expected_name: str = None, expected_dob: str = None, file: UploadFile = File(...)):
 
     os.makedirs("uploads/pan", exist_ok=True)
@@ -304,7 +310,7 @@ async def upload_pan(user_id: str, expected_name: str = None, expected_dob: str 
 # ------------------------------------------------
 # AADHAAR VERIFICATION API
 # ------------------------------------------------
-@app.post("/upload-aadhaar")
+@app.post("/upload-aadhaar", dependencies=[Depends(verify_service_key)])
 async def upload_aadhaar(user_id: str, expected_name: str = None, expected_dob: str = None, file: UploadFile = File(...)):
 
     os.makedirs("uploads/aadhaar", exist_ok=True)
@@ -405,7 +411,7 @@ async def upload_aadhaar(user_id: str, expected_name: str = None, expected_dob: 
 # SELFIE VERIFICATION API
 # ------------------------------------------------
 
-@app.post("/upload-selfie")
+@app.post("/upload-selfie", dependencies=[Depends(verify_service_key)])
 async def upload_selfie(user_id: str, file: UploadFile = File(...)):
 
     os.makedirs("uploads/selfie", exist_ok=True)
@@ -447,7 +453,7 @@ async def upload_selfie(user_id: str, file: UploadFile = File(...)):
 # ------------------------------------------------
 # LIVE KYC VERIFICATION API (Video Liveness)
 # ------------------------------------------------
-@app.post("/live-kyc")
+@app.post("/live-kyc", dependencies=[Depends(verify_service_key)])
 async def live_kyc(user_id: str, file: UploadFile = File(...)):
     os.makedirs("uploads/live_kyc", exist_ok=True)
     video_path = f"uploads/live_kyc/{user_id}_{file.filename}"
@@ -511,7 +517,7 @@ async def live_kyc(user_id: str, file: UploadFile = File(...)):
 
 
 
-@app.post("/upload-video-kyc")
+@app.post("/upload-video-kyc", dependencies=[Depends(verify_service_key)])
 async def upload_video_kyc(user_id: str, file: UploadFile = File(...)):
     """Alias for /live-kyc — used by AccuEntry_Backend proxy."""
     return await live_kyc(user_id, file)
@@ -519,7 +525,7 @@ async def upload_video_kyc(user_id: str, file: UploadFile = File(...)):
 # ------------------------------------------------
 # APPROVE KYC API
 # ------------------------------------------------
-@app.post("/agent/approve-kyc")
+@app.post("/agent/approve-kyc", dependencies=[Depends(verify_service_key)])
 def approve_kyc(user_id: str, agent_id: str):
 
     kyc = kyc_db.find_one({"user_id": user_id})
@@ -554,7 +560,7 @@ def approve_kyc(user_id: str, agent_id: str):
         "message": "automatic verification not complete"
     }
 
-@app.post("/agent/reject-kyc")
+@app.post("/agent/reject-kyc", dependencies=[Depends(verify_service_key)])
 def reject_kyc(user_id: str, agent_id: str, reason: str):
 
     kyc_db.update_one(
@@ -576,7 +582,7 @@ def reject_kyc(user_id: str, agent_id: str, reason: str):
         "reason": reason
     }
 
-@app.get("/agent/pending-kyc")
+@app.get("/agent/pending-kyc", dependencies=[Depends(verify_service_key)])
 def get_pending_kyc():
 
     records = list(
