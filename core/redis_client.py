@@ -11,6 +11,17 @@ except ImportError:  # pragma: no cover - optional dependency for local builds.
 load_dotenv()
 
 
+class _NoopRedisClient:
+	async def get(self, *args, **kwargs):
+		return None
+
+	async def set(self, *args, **kwargs):
+		return True
+
+	async def delete(self, *args, **kwargs):
+		return 0
+
+
 def _build_redis_client():
 	redis_url = os.getenv("REDIS_URL", "").strip()
 	if redis_url:
@@ -25,9 +36,8 @@ def _build_redis_client():
 		print(f"Connecting to Upstash Redis REST at: {rest_url}")
 		return UpstashRedis(url=rest_url, token=rest_token, allow_telemetry=False)
 
-	raise RuntimeError(
-		"Set REDIS_URL or UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN in AccuEntry_Verify/.env"
-	)
+	print("WARNING: REDIS_URL/UPSTASH_REDIS_REST_URL is not set; using no-op Redis client for startup.")
+	return _NoopRedisClient()
 
 
 redis_client = _build_redis_client()
