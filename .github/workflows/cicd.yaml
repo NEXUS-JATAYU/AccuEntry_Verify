@@ -1,75 +1,91 @@
-name: AccuVerify CI/CD
+name: AccuEntry Backend CI/CD
 
 on:
-	push:
-		branches:
-			- main
-		paths:
-			- "**"
-			- ".github/workflows/cicd.yaml"
-	workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "AccuEntry_Verify/**"
+      - ".github/workflows/cicd.yaml"
+  workflow_dispatch:
 
 concurrency:
-	group: accuverify-${{ github.ref }}
-	cancel-in-progress: true
+  group: accuverify-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
-	GCP_REGION: asia-south1
-	GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-	GAR_REPOSITORY: accuentry
-	CLOUD_RUN_SERVICE: accuverify
-	IMAGE_NAME: verify
-	BACKEND_ACCUENTRY_FASTAPI_URL: ${{ secrets.BACKEND_ACCUENTRY_FASTAPI_URL || 'https://accuentry-api-424990990402.asia-south1.run.app' }}
+  GCP_REGION: asia-south1
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GAR_REPOSITORY: accuentry
+  CLOUD_RUN_SERVICE: accuverify
+  IMAGE_NAME: verify
+  BACKEND_ACCUENTRY_FASTAPI_URL: ${{ secrets.BACKEND_ACCUENTRY_FASTAPI_URL || 'https://accuentry-api-424990990402.asia-south1.run.app' }}
+  FRONTEND_URL: https://virtusa-accu-entry-frontend.vercel.app
 
 jobs:
-	build-and-deploy:
-		name: Build and deploy Verify
-		runs-on: ubuntu-latest
-		permissions:
-			contents: read
+  build-and-deploy:
+    name: Build and deploy backend
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
-		steps:
-			- name: Checkout repository
-				uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-			- name: Authenticate to Google Cloud
-				uses: google-github-actions/auth@v2
-				with:
-					credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY}}
 
-			- name: Set up gcloud CLI
-				uses: google-github-actions/setup-gcloud@v2
-				with:
-					project_id: ${{ env.GCP_PROJECT_ID }}
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
 
-			- name: Configure Docker for Artifact Registry
-				run: |
-					gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
 
-			- name: Build and push verify image
-				uses: docker/build-push-action@v6
-				with:
-					context: .
-					file: ./Dockerfile
-					push: true
-					tags: |
-						${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-						${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        # use repo root as context and reference Dockerfile in repo root
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
 
-			- name: Deploy verify service to Cloud Run
-				run: |
-					gcloud run deploy "${CLOUD_RUN_SERVICE}" \
-						--image="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/${IMAGE_NAME}:${GITHUB_SHA}" \
-						--region="${GCP_REGION}" \
-						--project="${GCP_PROJECT_ID}" \
-						--platform=managed \
-						--ingress=all \
-						--allow-unauthenticated \
-						--memory=4Gi \
-						--cpu=2 \
-						--timeout=300 \
-						--concurrency=4 \
-						--min-instances=0 \
-						--max-instances=3 \
-						--port=8080 \
-						--update-env-vars="MONGO_DB_URL=${{ secrets.MONGO_DB_URL }},REDIS_URL=${{ secrets.REDIS_URL }},VERIFY_SERVICE_API_KEY=${{ secrets.VERIFY_SERVICE_API_KEY }},ADMIN_API_KEY=${{ secrets.ADMIN_API_KEY }},REQUIRE_VERIFY_SERVICE_KEY=true,REQUIRE_ADMIN_KEY=true,BACKEND_ACCUENTRY_FASTAPI_URL=${BACKEND_ACCUENTRY_FASTAPI_URL}"
+      - name: Deploy backend accuverify to Cloud Run
+        run: |
+          gcloud run deploy "${CLOUD_RUN_SERVICE}" \
+            --image="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/${IMAGE_NAME}:${GITHUB_SHA}" \
+            --region="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --platform=managed \
+            --ingress=all \
+            --allow-unauthenticated \
+            --memory=2Gi \
+            --cpu=1 \
+            --timeout=120 \
+            --concurrency=40 \
+            --min-instances=0 \
+            --max-instances=3 \
+            --port=8080 \
+            --update-env-vars="MONGO_DB_URL=${{ secrets.MONGO_DB_URL }},REDIS_URL=${{ secrets.REDIS_URL }},VERIFY_SERVICE_API_KEY=${{ secrets.VERIFY_SERVICE_API_KEY }},ADMIN_API_KEY=${{ secrets.ADMIN_API_KEY }},REQUIRE_VERIFY_SERVICE_KEY=true,REQUIRE_ADMIN_KEY=true,BACKEND_ACCUENTRY_FASTAPI_URL=${BACKEND_ACCUENTRY_FASTAPI_URL}"
+
+      - name: Grant backend service account access to AccuVerify
+        run: |
+          API_SA="$(gcloud run services describe "${CLOUD_RUN_SERVICE}" --region="${GCP_REGION}" --project="${GCP_PROJECT_ID}" --format='value(spec.template.spec.serviceAccountName)')"
+          if [ -z "${API_SA}" ] || [ "${API_SA}" = "default" ]; then
+            PROJECT_NUMBER="$(gcloud projects describe "${GCP_PROJECT_ID}" --format='value(projectNumber)')"
+            API_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+          fi
+
+          gcloud run services add-iam-policy-binding "accuverify" \
+            --region="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --member="serviceAccount:${API_SA}" \
+            --role="roles/run.invoker"
