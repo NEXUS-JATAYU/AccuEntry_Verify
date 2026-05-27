@@ -1,4 +1,4 @@
-name: AccuEntry Backend CI/CD
+name: AccuVerify CI/CD
 
 on:
   push:
@@ -24,7 +24,7 @@ env:
 
 jobs:
   build-and-deploy:
-    name: Build and deploy backend
+    name: Build and deploy AccuVerify
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -36,7 +36,7 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY}}
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Set up gcloud CLI
         uses: google-github-actions/setup-gcloud@v2
@@ -47,28 +47,33 @@ jobs:
         run: |
           gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
 
-      - name: Build and push backend image
+      # Required for GHA cache backend support in build-push-action
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push AccuVerify image
         uses: docker/build-push-action@v6
-        # use repo root as context and reference Dockerfile in repo root
         with:
           context: .
           file: ./Dockerfile
           push: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # GitHub Actions cache — scoped to accuverify so it doesn't
+          # collide with other services using the same workflow runner cache
+          cache-from: type=gha,scope=accuverify
+          cache-to: type=gha,scope=accuverify,mode=max
           tags: |
             ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
             ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
 
-      - name: Deploy backend accuverify to Cloud Run
+      - name: Deploy AccuVerify to Cloud Run
         run: |
           gcloud run deploy "${CLOUD_RUN_SERVICE}" \
             --image="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/${IMAGE_NAME}:${GITHUB_SHA}" \
             --region="${GCP_REGION}" \
             --project="${GCP_PROJECT_ID}" \
             --platform=managed \
-            --ingress=all \
-            --allow-unauthenticated \
+            --ingress=internal-and-cloud-load-balancing \
+            --no-allow-unauthenticated \
             --memory=2Gi \
             --cpu=1 \
             --timeout=120 \
@@ -78,15 +83,24 @@ jobs:
             --port=8080 \
             --update-env-vars="MONGO_DB_URL=${{ secrets.MONGO_DB_URL }},REDIS_URL=${{ secrets.REDIS_URL }},VERIFY_SERVICE_API_KEY=${{ secrets.VERIFY_SERVICE_API_KEY }},ADMIN_API_KEY=${{ secrets.ADMIN_API_KEY }},REQUIRE_VERIFY_SERVICE_KEY=true,REQUIRE_ADMIN_KEY=true,BACKEND_ACCUENTRY_FASTAPI_URL=${BACKEND_ACCUENTRY_FASTAPI_URL}"
 
-      - name: Grant backend service account access to AccuVerify
+      - name: Grant AccuEntry runtime SA invoker access on AccuVerify
         run: |
-          API_SA="$(gcloud run services describe "${CLOUD_RUN_SERVICE}" --region="${GCP_REGION}" --project="${GCP_PROJECT_ID}" --format='value(spec.template.spec.serviceAccountName)')"
+          # Resolve the service account AccuEntry Cloud Run is actually running as
+          API_SA="$(gcloud run services describe accuentry-api \
+            --region="${GCP_REGION}" \
+            --project="${GCP_PROJECT_ID}" \
+            --format='value(spec.template.spec.serviceAccountName)')"
+
+          # Fall back to the Compute Engine default SA if none is explicitly set
           if [ -z "${API_SA}" ] || [ "${API_SA}" = "default" ]; then
-            PROJECT_NUMBER="$(gcloud projects describe "${GCP_PROJECT_ID}" --format='value(projectNumber)')"
+            PROJECT_NUMBER="$(gcloud projects describe "${GCP_PROJECT_ID}" \
+              --format='value(projectNumber)')"
             API_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
           fi
 
-          gcloud run services add-iam-policy-binding "accuverify" \
+          echo "Granting roles/run.invoker to: ${API_SA}"
+
+          gcloud run services add-iam-policy-binding "${CLOUD_RUN_SERVICE}" \
             --region="${GCP_REGION}" \
             --project="${GCP_PROJECT_ID}" \
             --member="serviceAccount:${API_SA}" \
